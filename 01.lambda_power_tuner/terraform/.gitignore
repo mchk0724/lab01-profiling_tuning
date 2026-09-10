@@ -1,0 +1,6 @@
+# Terraform provider plugin and module
+.terraform/
+# Terraform state and lock
+*.tfstate
+*.tfstate.*
+.terraform.lock*

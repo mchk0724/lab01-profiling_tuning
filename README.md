@@ -11,6 +11,7 @@ The sample application is a minimal serverless CRUD stack (API Gateway → Lambd
 | # | Tool | 
 |---|------|
 | 01 | AWS Lambda Power Tuning | 
+| 02 | AWS X-Ray | 
 
 ---
 
@@ -108,3 +109,57 @@ From a performance perspective, the fact that increasing CPU/memory does not red
 #### 6. Delete resources
 
 Delete sample app and Lambda Power Tuner by `terraform destroy`.
+
+
+## 02. AWS X-Ray
+
+### Overview
+
+AWS X-Ray is a distributed tracing service that records the path a request takes through your application and shows where the time goes. Each request becomes a *trace* made up of *segments* (one per service, e.g. API Gateway or Lambda) and *subsegments* (individual calls such as a DynamoDB query or an outbound HTTP request), so a multi-service serverless path can be read as one end-to-end timeline.
+
+Typical uses in profiling and tuning work:
+
+- Find the slowest hop in an API Gateway → Lambda → DynamoDB chain instead of guessing from separate CloudWatch metrics.
+- Separate Lambda cold-start initialization time from handler execution time.
+- Spot errors, faults, and throttles, and see which downstream call caused them.
+- Use the service map and trace analytics to compare latency distributions  before and after a change.
+
+Tracing is enabled per service (for Lambda, `tracing_config { mode = "Active" }` plus the `AWSXRayDaemonWriteAccess` permissions), and instrumenting your own code with the X-Ray SDK is what turns AWS-managed segments into a full picture that includes your application's own calls. 
+
+### Quick start on sample app
+
+#### 1. Deploy X-Ray instrumented sample app 
+
+Go through [02.AWS_X-Ray/README.md](02.AWS_X-Ray/README.md) and deploy the X-Ray instrumented sample app. 
+
+#### 2. Ivoke X-Ray instrumented sample app  
+
+Ivoke the X-Ray instrumented sample app. Refer [sample-app/README.md](sample-app/README.md) for detail.
+
+
+#### 3. Check X-Ray trace
+
+Go to AWS Management Console and open CloudWatch, and click `Trace`. 
+
+If necessary, configure query time range and filter condition. And click `Run query`. 
+
+A list of traces will be provided. Click each of them to get the details.
+
+
+#### 4. Interpret the trace
+
+Here is a example trace detail.
+
+![X-Ray trace detail of sample app](pic/sample_output_xray.png)
+
+- In `Trace details` section, each circle is one service or resource that participated in this single request. Arrows show call direction.
+
+- In `Segments Timeline` section, bold rows are segments (one per node, with its AWS resource type), and indented rows beneath are subsegments (work inside that segment). 
+
+
+In this example, DynamoDB call consumed the majority of the time, not Lambda compute. On Lambda side, this was not cold start as no Initialization subsegment recorded. Therefore Lambda Memory/CPU tuning will have limited payoff here.
+
+
+#### 5. Delete resources
+
+Delete X-Ray instrumented sample app by `terraform destroy`.

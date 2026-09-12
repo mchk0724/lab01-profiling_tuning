@@ -1,0 +1,121 @@
+diff -ruN a/terraform/apigateway.tf b/terraform/apigateway.tf
+--- a/terraform/apigateway.tf	2026-09-10 20:49:27
++++ b/terraform/apigateway.tf	2026-09-10 21:05:32
+@@ -63,4 +63,6 @@
+   rest_api_id   = aws_api_gateway_rest_api.dynamodb_operations.id
+   deployment_id = aws_api_gateway_deployment.this.id
+   stage_name    = var.api_stage_name
++  # Emit X-Ray traces for requests handled by this stage.
++  xray_tracing_enabled = true
+ }
+\ No newline at end of file
+diff -ruN a/terraform/iam.tf b/terraform/iam.tf
+--- a/terraform/iam.tf	2026-09-10 20:49:27
++++ b/terraform/iam.tf	2026-09-10 21:09:29
+@@ -35,6 +35,15 @@
+     ]
+     resources = ["*"]
+   }
++  # Required for the Lambda X-Ray integration to publish trace segments.
++  statement {
++    effect = "Allow"
++    actions = [
++      "xray:PutTraceSegments",
++      "xray:PutTelemetryRecords",
++    ]
++    resources = ["*"]
++  }
+ }
+ resource "aws_iam_policy" "lambda_custom_policy" {
+   name   = "lambda-custom-policy"
+diff -ruN a/terraform/lambda.tf b/terraform/lambda.tf
+--- a/terraform/lambda.tf	2026-09-10 20:49:27
++++ b/terraform/lambda.tf	2026-09-10 21:24:50
+@@ -3,6 +3,49 @@
+   source_file = "${path.module}/lambda_src/lambda_function.py"
+   output_path = "${path.module}/build/lambda_function.zip"
+ }
++locals {
++  # A layer zip must place Python packages under `python/` to land on sys.path.
++  xray_layer_dir = "${path.module}/build/xray_layer"
++}
++# aws-xray-sdk is not part of the Lambda Python runtime, so it is vendored into a
++# layer. Wheels are resolved for the Lambda runtime's platform rather than for
++# the machine running Terraform.
++resource "terraform_data" "xray_layer_build" {
++  triggers_replace = [
++    filesha256("${path.module}/lambda_src/requirements.txt"),
++  ]
++  provisioner "local-exec" {
++    interpreter = ["/bin/bash", "-c"]
++    command     = <<-EOT
++      set -euo pipefail
++      rm -rf "${local.xray_layer_dir}"
++      mkdir -p "${local.xray_layer_dir}/python"
++      python3 -m pip install \
++        --quiet \
++        --no-compile \
++        --no-deps \
++        --only-binary=:all: \
++        --platform manylinux2014_x86_64 \
++        --implementation cp \
++        --python-version 3.13 \
++        --target "${local.xray_layer_dir}/python" \
++        --requirement "${path.module}/lambda_src/requirements.txt"
++    EOT
++  }
++}
++data "archive_file" "xray_layer_zip" {
++  type        = "zip"
++  source_dir  = local.xray_layer_dir
++  output_path = "${path.module}/build/xray_layer.zip"
++  depends_on  = [terraform_data.xray_layer_build]
++}
++resource "aws_lambda_layer_version" "xray_sdk" {
++  layer_name               = "${var.lambda_function_name}-xray-sdk"
++  filename                 = data.archive_file.xray_layer_zip.output_path
++  source_code_hash         = data.archive_file.xray_layer_zip.output_base64sha256
++  compatible_runtimes      = ["python3.13"]
++  compatible_architectures = ["x86_64"]
++}
+ # Created explicitly so retention is bounded and `terraform destroy` removes it.
+ # Lambda would otherwise auto-create this group with never-expire retention.
+ resource "aws_cloudwatch_log_group" "lambda" {
+@@ -17,6 +60,11 @@
+   timeout          = 10
+   filename         = data.archive_file.lambda_zip.output_path
+   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
++  layers           = [aws_lambda_layer_version.xray_sdk.arn]
++  # Sample every request rather than deferring to the upstream sampling decision.
++  tracing_config {
++    mode = "Active"
++  }
+   depends_on = [
+     aws_iam_role_policy_attachment.lambda_custom_policy,
+     aws_cloudwatch_log_group.lambda,
+diff -ruN a/terraform/lambda_src/lambda_function.py b/terraform/lambda_src/lambda_function.py
+--- a/terraform/lambda_src/lambda_function.py	2026-09-10 20:49:27
++++ b/terraform/lambda_src/lambda_function.py	2026-09-10 21:14:30
+@@ -2,6 +2,13 @@
+ import boto3
+ import json
+ 
++from aws_xray_sdk.core import patch
++
++# Record every boto3 DynamoDB call as a subsegment of the Lambda segment.
++# boto3's resource API dispatches through botocore, so patching botocore alone
++# captures the table operations below.
++patch(('botocore',))
++
+ print('Loading function')
+ 
+ 
+diff -ruN a/terraform/lambda_src/requirements.txt b/terraform/lambda_src/requirements.txt
+--- a/terraform/lambda_src/requirements.txt	1970-01-01 00:00:00
++++ b/terraform/lambda_src/requirements.txt	2026-09-10 21:14:59
+@@ -0,0 +1,5 @@
++# Vendored into the deployment package by lambda.tf with --no-deps.
++# aws-xray-sdk also requires botocore, which the Lambda Python runtime already
++# provides, so it is deliberately not listed here.
++aws-xray-sdk==2.15.0
++wrapt==2.4.0
